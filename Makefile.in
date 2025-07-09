@@ -75,7 +75,10 @@ endif
 
 CFLAGS ?= $(DEFAULT_CFLAGS)
 CXXFLAGS ?= $(DEFAULT_CFLAGS)
-CXXFLAGS += -g -pthread -fprofile-arcs -ftest-coverage 
+
+# CFLAGS += -fsanitize=address
+# CXXFLAGS += -fsanitize=address
+# LDFLAGS += -lasan
 
 ifneq ($(OS), Windows)
 ifeq ($(findstring -fPIC, $(CFLAGS)), )
@@ -143,6 +146,7 @@ endif
 ifeq ($(USE_MULTIMAP), yes)
 	CPPFLAGS += -DUSE_MULTIMAP
 endif
+
 
 CPPFLAGS += $(addprefix -D, $(DEFINES))
 CPPFLAGS += $(addprefix -I, $(INCDIRS))

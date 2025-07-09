@@ -11,14 +11,19 @@
 #include "string.h"
 #include <string>
 #include <unistd.h>
-#include "cwe_samples.h"
 #include <sanitizer/asan_interface.h>
+#include "signal.h"
+#include <sys/wait.h>
+#include "requests.h"
+#include "hthread.h" // import hv_gettid
+#include "hloop.h"
+#include "hbase.h"
+#include "hlog.h"
+#include "nlog.h"
+#include <stdio.h>
+#include "http_client.h"
+#include "HttpMessage.h"
 
-/******************************************************************************\
- *
- *      Register sigacation
- *
-\******************************************************************************/
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,8 +32,135 @@ void __gcov_flush();
 }
 #endif
 
+int port;
+pid_t child_pid = -1;
+
+extern "C" {
+int test_cjson(char *content);
+int start_tcp_echo_server();
+int test_hloop();
+int test_connect(int port);
+int test_date();
+int test_hatomic_main();
+int test_hmutex();
+int test_md5(char *data);
+int test_sha1(char *data);
+int test_socketpair();
+}
+int test_nmap();
+int test_curl(int argc, char *argv[]);
+int test_hstring();
+int test_hthread();
+int test_ifconfig();
+int test_hdir();
+int test_objectpool();
+int test_sync();
+int test_base64(char *data);
+int test_parse_confile();
+int test_websocket_server();
+int test_websocket_client();
+
+static int response_status(HttpResponse *resp, int code = 200, const char *message = NULL) {
+    resp->Set("code", code);
+    if (message == NULL) message = http_status_str((enum http_status)code);
+    resp->Set("message", message);
+    resp->DumpBody();
+    return code;
+}
+
+int test_http_client(char *url) {
+    HttpRequest req;
+    req.method = HTTP_GET;
+    req.url = url;
+    req.timeout = 3;
+    HttpResponse res;
+    int ret = http_client_send(&req, &res);
+    printf("%s\n", req.Dump(true, true).c_str());
+    if (ret != 0) {
+        printf("* Failed:%s:%d\n", http_client_strerror(ret), ret);
+    }
+    else {
+        printf("%s\n", res.Dump(true, true).c_str());
+    }
+    return ret;
+}
+
+static void test_http_async_client(int *finished) {
+    printf("test_http_async_client request thread tid=%ld\n", hv_gettid());
+    char url[128];
+    sprintf(url, "http://127.0.0.1:%d/echo", port);
+
+    HttpRequestPtr req(new HttpRequest);
+    req->method = HTTP_POST;
+    // req->url = "127.0.0.1:9090/echo";
+    req->url = strdup(url);
+    req->headers["Connection"] = "keep-alive";
+    req->body = "this is an async request.";
+    req->timeout = 1;
+    printf("=> test_http_async_client, url: %s\n", req->url.c_str());
+    http_client_send_async(req, [finished](const HttpResponsePtr &resp) {
+        printf("test_http_async_client response thread tid=%ld\n", hv_gettid());
+        if (resp == NULL) {
+            printf("request failed!\n");
+        }
+        else {
+            printf("%d %s\r\n", resp->status_code, resp->status_message());
+            printf("%s\n", resp->body.c_str());
+        }
+        *finished = 1;
+    });
+}
+
+static void test_http_sync_get() {
+    // auto resp = requests::get("http://www.example.com");
+    //
+    // make clean && make WITH_OPENSSL=yes
+    // auto resp = requests::get("https://www.baidu.com");
+    char url[128];
+    sprintf(url, "http://127.0.0.1:%d/User", port);
+
+    // auto resp = requests::get("http://127.0.0.1:9090/WithdrawOrder?order_id=2");
+    auto resp = requests::get(url);
+    if (resp == NULL) {
+        printf("request failed!\n");
+    }
+    else {
+        printf("%d %s\r\n", resp->status_code, resp->status_message());
+        printf("%s\n", resp->body.c_str());
+    }
+}
+
+static void test_http_sync_post() {
+    char url[128];
+    sprintf(url, "http://127.0.0.1:%d/echo", port);
+
+    hv::Json jroot;
+    jroot["user"] = "admin";
+    http_headers headers;
+    headers["Content-Type"] = "application/json";
+    // resp = requests::post("127.0.0.1:9090/echo", jroot.dump(), headers);
+    auto resp = requests::post(url, jroot.dump(), headers);
+    if (resp == NULL) {
+        printf("request failed!\n");
+    }
+    else {
+        printf("%d %s\r\n", resp->status_code, resp->status_message());
+        printf("%s\n", resp->body.c_str());
+    }
+}
+
+/******************************************************************************\
+ *
+ *      Register sigacation
+ *
+\******************************************************************************/
 static void sigterm_handler(int signum) {
     printf("received signal\n");
+    __gcov_flush();
+    if (child_pid != -1) {
+        kill(child_pid, SIGTERM);    // 发送SIGTERM信号给子进程
+        waitpid(child_pid, NULL, 0); // 等待子进程结束
+    }
     __gcov_flush();
     exit(0);
 }
@@ -280,22 +412,6 @@ int buyStockbyCode(char *stock_code, float price, int qty) {
     return 0;
 }
 
-int buyStockbyComboConditions(char *stock_code, int mktID, float price, int qty) {
-    StockClass *stock = new StockClass();
-    int ret = queryStock(stock_code, mktID, stock);
-    if (ret != 0) {
-        delete stock;
-        return -404;
-    }
-    printf("============================found out stock============================\n");
-    if (buyStock(stock, price, qty) != 0) {
-        delete stock;
-        return -500;
-    }
-    delete stock;
-    return 0;
-}
-
 int sellStock(StockClass *stock, float price, int qty) {
     // 检查账户是否有开通该市场的交易许可
     if (account->mktPermission((char *)stock->mkt.c_str()) != true) {
@@ -382,24 +498,6 @@ int sellStockbyCode(char *stock_code, float price, int qty) {
     return 0;
 }
 
-int sellStockbyComboConditions(char *stock_code, int mktID, float price, int qty) {
-    StockClass *stock = new StockClass();
-    int ret = queryStock(stock_code, mktID, stock);
-    if (ret != 0) {
-        delete stock;
-        return -404;
-    }
-    printf("============================found out stock============================\n");
-    stock->print();
-    if (sellStock(stock, price, qty) != 0) {
-        delete stock;
-        return -600;
-    }
-
-    delete stock;
-    return 0;
-}
-
 int withdrawOrder(long id) {
     OrderClass item;
     std::list<OrderClass>::iterator iter_order;
@@ -427,15 +525,282 @@ int withdrawOrder(long id) {
     return -704;
 }
 
+HV_EXPORT int handle_check_course(HttpRequest *req, HttpResponse *resp) {
+    printf("##################################################\t/CheckCourse\t##################################################\n");
+    resp->content_type = req->content_type;
+    resp->body = req->body;
+    printf("Request Body:%s\n", req->body.c_str());
+
+    cJSON *cjson_body = cJSON_Parse(req->body.c_str());
+    char *weekday = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "weekday"));
+    float hours = cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "hours"));
+    int qty = static_cast<int>(std::round(cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "qty"))));
+    char *notes = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "notes"));
+
+    printf("***\tCheckCourse, weekday:%s, hours:%.3f, qty:%d\n", weekday, hours, qty);
+    if (weekday == NULL) {
+        return 400;
+    }
+    if (strcmp(weekday, "MONDAY") == 0) {
+        printf("MONDAY...\n");
+        test_cjson((char *)req->body.c_str());
+    }
+    else if (strcmp(weekday, "TUESDAY") == 0) {
+        printf("TUESDAY...\n");
+        int finished = 0;
+        test_http_async_client(&finished);
+    }
+    else if (strcmp(weekday, "WEDNESDAY") == 0) {
+        printf("WEDNESDAY...\n");
+        test_nmap();
+    }
+    else if (strcmp(weekday, "THURSDAY") == 0) {
+        printf("THURSDAY...\n");
+        char buff[256];
+        sprintf(buff, "http://127.0.0.1:%d/echo", port);
+        test_http_client(buff);
+    }
+    else if (strcmp(weekday, "FRIDAY") == 0) {
+        printf("FRIDAY...\n");
+        test_hloop();
+    }
+    else if (strcmp(weekday, "SATDAY") == 0) {
+        printf("SATDAY...\n");
+        // test_http_sync_get();
+        int argc = 4;
+        char *argv[5];
+        argv[0] = strdup("./http_server_test");
+        argv[1] = strdup("-v");
+        argv[2] = strdup("localhost:6666");
+        argv[3] = strdup("-d");
+        argv[4] = strdup(req->body.c_str());
+        test_curl(argc, argv);
+        free(argv[0]);
+        free(argv[1]);
+        free(argv[2]);
+        free(argv[3]);
+        free(argv[4]);
+    }
+    else if (strcmp(weekday, "SUNDAY") == 0) {
+        printf("SUNDAY...\n");
+        test_http_sync_post();
+    }
+    else {
+        printf("Others, qty=%d\n", qty);
+        switch (qty) {
+        case 1: test_connect(port); break;
+        case 2: printf("b\n"); break;
+        case 3: printf("c\n"); break;
+        default: printf("others\n"); break;
+        }
+    }
+
+    if (hours >= 8.30 && hours <= 18.30) {
+        printf("Working hours...\n");
+        test_date();
+        test_hatomic_main();
+    }
+    else {
+        printf("Off hours...\n");
+        test_hmutex();
+        test_md5(notes);
+        test_sha1(notes);
+    }
+
+    if (cjson_body != NULL) {
+        cJSON_Delete(cjson_body);
+    }
+    cjson_body = cJSON_CreateObject();
+    cJSON_AddStringToObject(cjson_body, "return_code", "0");
+    cJSON_AddStringToObject(cjson_body, "message", "成功！");
+    cJSON_Delete(cjson_body);
+    response_status(resp, 0, "OK");
+    return 200;
+}
+
+HV_EXPORT int handle_insert_order(HttpRequest *req, HttpResponse *resp) {
+    printf("##################################################\t/InsertOrder\t##################################################\n");
+    resp->content_type = req->content_type;
+    resp->body = req->body;
+    // printf("Request Body:%s\n", req->body.c_str());
+
+    cJSON *cjson_body = cJSON_Parse(req->body.c_str());
+    char *code = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "ticker"));
+    char *mkt = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "market"));
+    char *side = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "side"));
+    float price = cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "price"));
+    int qty = static_cast<int>(std::round(cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "qty"))));
+
+    cJSON *client_id = cJSON_GetObjectItem(cjson_body, "client_id");
+    cJSON *business_type = cJSON_GetObjectItem(cjson_body, "business_type");
+    printf("***\tInsertOrder, ticker:%s, market:%s, side:%s, price:%.3f, qty:%d\n", code, mkt, side, price, qty);
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 加上检查传入参数
+    if (code == NULL || mkt == NULL || side == NULL) {
+        printf("ERROR:\tInsertOrder, required paramenter can't be null!\n");
+        return 201;
+    }
+    if (qty > 65535 || qty < 0) {
+        printf("ERROR:\tInsertOrder, qyt value is incorrect!\n");
+        return 201;
+    }
+    if (std::isnan(price)) {
+        printf("ERROR:\tInsertOrder, price value is nan!\n");
+        return 201;
+    }
+    if (price > 65535 || qty < 0) {
+        printf("ERROR:\tInsertOrder, price value is incorrect!\n");
+        return 201;
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    int ret_code;
+
+    if (strcmp(side, "买") == 0) {
+        printf("买入\n");
+        ret_code = buyStockbyCode(code, price, qty);
+    }
+    else {
+        printf("卖出\n");
+        printf("ticker:%s, market:%s, side:%s, price:%.3f, qty:%d\n", code, mkt, side, price, qty);
+        ret_code = sellStockbyCode(code, price, qty);
+    }
+    if (cjson_body != NULL) {
+        cJSON_Delete(cjson_body);
+    }
+    cjson_body = cJSON_CreateObject();
+    cJSON_AddStringToObject(cjson_body, "return_code", std::to_string(ret_code).c_str());
+    //__gcov_flush();
+    if (ret_code != 0) {
+        cJSON_AddStringToObject(cjson_body, "message", errorTxt);
+        resp->body = cJSON_Print(cjson_body);
+        return 400;
+    }
+    else {
+        cJSON_AddStringToObject(cjson_body, "message", "成功！");
+        resp->body = cJSON_Print(cjson_body);
+        memset(logTxt, 0, 2048);
+        sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "委托", side, code, mkt);
+        UtilsClass::writeMsg(success_logfile, logTxt);
+    }
+    cJSON_Delete(cjson_body);
+    response_status(resp, 0, "OK");
+    return 200;
+}
+
+HV_EXPORT int handle_query_stock_bycode(HttpRequest *req, HttpResponse *resp) {
+    printf("##################################################\t/QueryStockbycode\t##################################################\n");
+    resp->content_type = req->content_type;
+    resp->body = req->body;
+    // printf("Request Body:%s\n", req->body.c_str());
+    int ret_code;
+    cJSON *cjson_body = cJSON_Parse(req->body.c_str());
+    cJSON *code = cJSON_GetObjectItem(cjson_body, "stock_code");
+    printf("***\tQueryStockbyCode, stock_code:%s\n", cJSON_GetStringValue(code));
+    if (cJSON_GetStringValue(code) == NULL) {
+        return 400;
+    }
+    StockClass *stock = new StockClass();
+    ret_code = queryStockbyCode(cJSON_GetStringValue(code), stock);
+    //__gcov_flush();
+
+    if (ret_code == 0) {
+        stock->print();
+        if (cjson_body != NULL) {
+            cJSON_Delete(cjson_body);
+        }
+        cjson_body = cJSON_CreateArray();
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "trade_date", stock->trade_date.c_str());
+        cJSON_AddStringToObject(item, "stock_code", stock->stock_code.c_str());
+        cJSON_AddStringToObject(item, "stock_name", stock->stock_name.c_str());
+        cJSON_AddStringToObject(item, "mkt", stock->mkt.c_str());
+        cJSON_AddStringToObject(item, "yesterday_price", stock->yesterday_price.c_str());
+        cJSON_AddStringToObject(item, "open_price", stock->open_price.c_str());
+        cJSON_AddStringToObject(item, "high_price", stock->high_price.c_str());
+        cJSON_AddStringToObject(item, "low_price", stock->low_price.c_str());
+        cJSON_AddStringToObject(item, "close_price", stock->close_price.c_str());
+        cJSON_AddStringToObject(item, "increase_rate", stock->increase_rate.c_str());
+        cJSON_AddStringToObject(item, "qty", stock->qty.c_str());
+        cJSON_AddStringToObject(item, "amount", stock->amount.c_str());
+        cJSON_AddStringToObject(item, "per", stock->per.c_str());
+        cJSON_AddItemToArray(cjson_body, item);
+        resp->body = cJSON_Print(cjson_body);
+        memset(logTxt, 0, 2048);
+        sprintf(logTxt, "%s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "代码查股票", stock->stock_code.c_str());
+        UtilsClass::writeMsg(success_logfile, logTxt);
+    }
+    else {
+        response_status(resp, 400, "there are something wrong!");
+        return 400;
+    }
+    delete stock;
+    cJSON_Delete(cjson_body);
+    response_status(resp, 0, "OK");
+    return 200;
+}
+
+HV_EXPORT int handle_grade(HttpRequest *req, HttpResponse *resp) {
+    printf("##################################################\t/Grade\t##################################################\n");
+    printf("Request Body:%s\n", req->body.c_str());
+
+    cJSON *cjson_body = cJSON_Parse(req->body.c_str());
+    float grade = cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "grade"));
+    char *key = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "key"));
+    char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
+
+    if (grade >= 90) {
+        printf("Grade Level A\n");
+        test_hthread();
+        test_ifconfig();
+        test_hdir();
+        test_objectpool();
+        test_parse_confile();
+        test_websocket_client();
+    }
+    else if (grade >= 80) {
+        printf("Grade Level B\n");
+        test_socketpair();
+        test_hstring();
+        test_sync();
+        test_base64(data);
+    }
+    else if (grade >= 70) {
+        printf("Grade Level C\n");
+    }
+    else if (grade >= 60) {
+        printf("Grade Level D\n");
+    }
+    else {
+        printf("Grade Level F\n");
+    }
+    cJSON_Delete(cjson_body);
+    response_status(resp, 0, "OK");
+    return 200;
+}
+
+static int handle_json(HttpRequest *req, HttpResponse *resp) {
+    if (req->content_type != APPLICATION_JSON) {
+        return response_status(resp, HTTP_STATUS_BAD_REQUEST);
+    }
+    hv::Json jroot = hv::Json::parse(req->body.c_str(), NULL, false);
+
+    resp->content_type = APPLICATION_JSON;
+    resp->json = req->json;
+    resp->json["int"] = 123;
+    resp->json["float"] = 3.14;
+    resp->json["string"] = "hello";
+    return 200;
+}
+
 int main(int argc, char **argv) {
     HV_MEMCHECK;
 
     HttpService router;
 
     reg_sigterm_handler(sigterm_handler);
-
     initial();
-    int port = 8080;
+    port = 9090;
 
     if (argc >= 2) {
         port = atoi(argv[1]);
@@ -444,1095 +809,72 @@ int main(int argc, char **argv) {
     if (argc >= 3) {
         ::i_data_len = atoi(argv[2]);
     }
-    printf("Call CWE code while data len exceeds: [%d]\n", ::i_data_len);
-
-    router.GET("/ping", [](HttpRequest *req, HttpResponse *resp) { return resp->String("pong"); });
-
-    router.GET("/data", [](HttpRequest *req, HttpResponse *resp) {
-        static char data[] = "0123456789";
-        return resp->Data(data, 10);
-    });
-
-    router.GET("/paths", [&router](HttpRequest *req, HttpResponse *resp) { return resp->Json(router.Paths()); });
-
     router.POST("/echo", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        resp->body = req->body;
+        printf("##################################################\t/echo\t##################################################\n");
+        response_status(resp, 0, "OK");
         return 200;
     });
 
-    router.POST("/sync", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        resp->body = req->body;
-        printf("Request body: %s\n", req->body);
-
-        return 200;
-    });
-
-    router.GET("/User", [&router](HttpRequest *req, HttpResponse *resp) {
-        string code = req->GetString("userId");
-        printf("***\tUser, userId:%s\n", code.c_str());
+    router.POST("/User", [&router](HttpRequest *req, HttpResponse *resp) {
+        printf("##################################################\t/User\t##################################################\n");
+        string code = req->GetString("user");
+        printf("***\tUser, user:%s\n", code.c_str());
 
         for (auto &param : req->query_params) {
             printf("%s : %s\n", param.first.c_str(), param.second.c_str());
         }
+        response_status(resp, 0, "OK");
         return 200;
     });
 
-    router.GET("/PrintParameters", [&router](HttpRequest *req, HttpResponse *resp) {
-        printf("***\tPrintParameters:%s\n");
-        for (auto &param : req->query_params) {
-            printf("%s : %s\n", param.first.c_str(), param.second.c_str());
-        }
-        return 200;
-    });
-
-    router.POST("/CheckCourse", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        resp->body = req->body;
-        printf("Request Body:%s\n", req->body.c_str());
-
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *weekday = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "weekday"));
-        float hours = cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "hours"));
-        int qty = static_cast<int>(std::round(cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "qty"))));
-
-        printf("***\tCheckCourse, weekday:%s, hours:%.3f, qty:%d\n", weekday, hours, qty);
-        if (strcmp(weekday, "MONDAY") == 0) {
-            printf("MONDAY...\n");
-        }
-        else if (strcmp(weekday, "TUESDAY") == 0) {
-            printf("TUESDAY...\n");
-        }
-        else if (strcmp(weekday, "WEDNESDAY") == 0) {
-            printf("WEDNESDAY...\n");
-        }
-        else if (strcmp(weekday, "THURSDAY") == 0) {
-            printf("THURSDAY...\n");
-        }
-        else if (strcmp(weekday, "FRIDAY") == 0) {
-            printf("FRIDAY...\n");
-        }
-        else if (strcmp(weekday, "SATDAY") == 0) {
-            printf("SATDAY...\n");
-        }
-        else if (strcmp(weekday, "SUNDAY") == 0) {
-            printf("SUNDAY...\n");
-        }
-        else {
-            printf("Others...\n");
-        }
-
-        if (hours >= 8.30 && hours <= 18.30) {
-            printf("Working hours...\n");
-        }
-        else {
-            printf("Off hours...\n");
-        }
-
-        switch (qty) {
-        case 1: printf("a\n");
-        case 2: printf("b\n");
-        case 3: printf("c\n");
-        default: printf("others\n");
-        }
-
-        if (cjson_body != NULL) {
-            cJSON_Delete(cjson_body);
-        }
-        cjson_body = cJSON_CreateObject();
-        cJSON_AddStringToObject(cjson_body, "return_code", "0");
-        cJSON_AddStringToObject(cjson_body, "message", "成功！");
-        resp->body = cJSON_Print(cjson_body);
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/InsertOrder", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        resp->body = req->body;
-        // printf("Request Body:%s\n", req->body.c_str());
-
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *code = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "ticker"));
-        char *mkt = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "market"));
-        char *side = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "side"));
-        float price = cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "price"));
-        int qty = static_cast<int>(std::round(cJSON_GetNumberValue(cJSON_GetObjectItem(cjson_body, "qty"))));
-
-        cJSON *client_id = cJSON_GetObjectItem(cjson_body, "client_id");
-        cJSON *business_type = cJSON_GetObjectItem(cjson_body, "business_type");
-        printf("***\tInsertOrder, ticker:%s, market:%s, side:%s, price:%.3f, qty:%d\n", code, mkt, side, price, qty);
-        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // 加上检查传入参数
-        if (code == NULL || mkt == NULL || side == NULL) {
-            printf("ERROR:\tInsertOrder, required paramenter can't be null!\n");
-            return 201;
-        }
-        if (qty > 65535 || qty < 0) {
-            printf("ERROR:\tInsertOrder, qyt value is incorrect!\n");
-            return 201;
-        }
-        if (std::isnan(price)) {
-            printf("ERROR:\tInsertOrder, price value is nan!\n");
-            return 201;
-        }
-        if (price > 65535 || qty < 0) {
-            printf("ERROR:\tInsertOrder, price value is incorrect!\n");
-            return 201;
-        }
-
-        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        int ret_code;
-
-        if (strcmp(side, "买") == 0) {
-            printf("买入\n");
-            ret_code = buyStockbyCode(code, price, qty);
-        }
-        else {
-            printf("卖出\n");
-            printf("ticker:%s, market:%s, side:%s, price:%.3f, qty:%d\n", code, mkt, side, price, qty);
-            ret_code = sellStockbyCode(code, price, qty);
-        }
-        if (cjson_body != NULL) {
-            cJSON_Delete(cjson_body);
-        }
-        cjson_body = cJSON_CreateObject();
-        cJSON_AddStringToObject(cjson_body, "return_code", std::to_string(ret_code).c_str());
-        //__gcov_flush();
-        if (ret_code != 0) {
-            cJSON_AddStringToObject(cjson_body, "message", errorTxt);
-            resp->body = cJSON_Print(cjson_body);
-            return 400;
-        }
-        else {
-            cJSON_AddStringToObject(cjson_body, "message", "成功！");
-            resp->body = cJSON_Print(cjson_body);
-            memset(logTxt, 0, 2048);
-            sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "委托", side, code, mkt);
-            UtilsClass::writeMsg(success_logfile, logTxt);
-        }
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/QueryStockbyCode", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        resp->body = req->body;
-        // printf("Request Body:%s\n", req->body.c_str());
-        int ret_code;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        cJSON *code = cJSON_GetObjectItem(cjson_body, "stock_code");
-        printf("***\tQueryStockbyCode, stock_code:%s\n", cJSON_GetStringValue(code));
-        StockClass *stock = new StockClass();
-        ret_code = queryStockbyCode(cJSON_GetStringValue(code), stock);
-        //__gcov_flush();
-
-        if (ret_code == 0) {
-            stock->print();
-            if (cjson_body != NULL) {
-                cJSON_Delete(cjson_body);
-            }
-            cjson_body = cJSON_CreateArray();
-            cJSON *item = cJSON_CreateObject();
-            cJSON_AddStringToObject(item, "trade_date", stock->trade_date.c_str());
-            cJSON_AddStringToObject(item, "stock_code", stock->stock_code.c_str());
-            cJSON_AddStringToObject(item, "stock_name", stock->stock_name.c_str());
-            cJSON_AddStringToObject(item, "mkt", stock->mkt.c_str());
-            cJSON_AddStringToObject(item, "yesterday_price", stock->yesterday_price.c_str());
-            cJSON_AddStringToObject(item, "open_price", stock->open_price.c_str());
-            cJSON_AddStringToObject(item, "high_price", stock->high_price.c_str());
-            cJSON_AddStringToObject(item, "low_price", stock->low_price.c_str());
-            cJSON_AddStringToObject(item, "close_price", stock->close_price.c_str());
-            cJSON_AddStringToObject(item, "increase_rate", stock->increase_rate.c_str());
-            cJSON_AddStringToObject(item, "qty", stock->qty.c_str());
-            cJSON_AddStringToObject(item, "amount", stock->amount.c_str());
-            cJSON_AddStringToObject(item, "per", stock->per.c_str());
-            cJSON_AddItemToArray(cjson_body, item);
-            resp->body = cJSON_Print(cjson_body);
-            memset(logTxt, 0, 2048);
-            sprintf(logTxt, "%s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "代码查股票", stock->stock_code.c_str());
-            UtilsClass::writeMsg(success_logfile, logTxt);
-        }
-        else {
-            return 400;
-        }
-        delete stock;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    router.POST("/CWE_561", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_561\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_561(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_788", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_788\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_788(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_476", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_476\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_476(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_129", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_129\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_129(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_252", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_252\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_252(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_401", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_401\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_401(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_805", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_805\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_805(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_131", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_131\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_131(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_667", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_667\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_667(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_366", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_366\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_366(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_820", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_820\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_820(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_833", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_833\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_833(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_835", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_835\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_835(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_606", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_606\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_606(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_562", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_562\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_562(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_786", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_786\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_786(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_194", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_194\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_194(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_789", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_789\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_789(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_783", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_783\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_783(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_805", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_805\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_805(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_390", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_390\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_390(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_404", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_404\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_404(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_477", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_477\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_477(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_478", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_478\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_478(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_480", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_480\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) % 2 == 0) {
-            if (strlen(data) > ::i_data_len) test_CWE_480(data, strlen(data));
-        }
-        else {
-            if (strlen(data) > ::i_data_len) test_CWE_480_case2(data, strlen(data));
-        }
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_484", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_484\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_484(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_123", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_123\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_123(data);
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_570", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_570\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_570(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_571", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_571\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_571(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_665", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_665\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_665(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_456", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_456\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_456(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_457", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_457\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_457(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_197", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_197\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_197(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_732", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_732\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_732(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_170", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_170\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_170(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_798", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_798\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_798(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_908", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_908\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_908(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_1041", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_1041\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_1041(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_571", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_571\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_571(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_787", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_787\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_787();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_125", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_125\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_125();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_191", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_191\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_191();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_416", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_416\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_416();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_190", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_190\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_190();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_120", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_120\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_120();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_369", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_369\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_369();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_468", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_468\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_468();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_681", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_681\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_681();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_415", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_415\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_415();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_590", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_590\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_590();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_193", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_193\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_193();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_464", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_464\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_464();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_88", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_88\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_88(data, strlen(data));
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_482", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_482\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_482();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
+    router.GET("/WithdrawOrder", [&router](HttpRequest *req, HttpResponse *resp) {
+        printf("##################################################\t/WithdrawOrder\t##################################################\n");
+        printf("Request url:%s\n", req->url.c_str());
+        long order_id = atoi(req->GetParam("order_id").c_str());
+        printf("***\torder_id:%ld\n", order_id);
 
-    router.POST("/StackBufferUnderflow", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>StackBufferUnderflow\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) stackBufferUnderflow();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
+        withdrawOrder(order_id);
+        response_status(resp, 0, "OK");
         return 200;
     });
 
-    router.POST("/MemLeak", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>MemLeak\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) memLeak();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/ArrayIndexUnderflow", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>ArrayIndexUnderflow\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) arrayIndexUnderflow();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CWE_467", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CWE_467\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) test_CWE_467();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/ModifyStringLiteral", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>ModifyStringLiteral\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        // int a=0;
-        // int b = 10/a;
-        if (strlen(data) > ::i_data_len) modifyStringLiteral();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/GlobalBufferOverflow", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>GlobalBufferOverflow\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) globalBufferOverflow();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/UseAfterScope", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>UseAfterScope\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) useAfterScope();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/Pointer2ObjectWithEndedLifetime", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>Pointer2ObjectWithEndedLifetime\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) pointer2ObjectWithEndedLifetime();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/UseAfterReturn", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>UseAfterReturn\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) useAfterReturn();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/ConversionBetweenTwoPointerTtypes", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>ConversionBetweenTwoPointerTtypes\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) conversionBetweenTwoPointerTtypes();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/FunctionCallThroughtPointer", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>FunctionCallThroughtPointer\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) functionCallThroughtPointer();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/PointerSubtraction", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>PointerSubtraction\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) pointerSubtraction();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/PointerAddition", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>PointerAddition\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) pointerAddition();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/ArrayOutofBoundRead", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>ArrayOutofBoundRead\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) arrayOutofBoundRead();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/SubstractingTwoPointers", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>SubstractingTwoPointers\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) substractingTwoPointers();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/CopyingOverlappingMemory", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>CopyingOverlappingMemory\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) copyingOverlappingMemory();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/PointUsedAfterFree", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>PointUsedAfterFree\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) pointUsedAfterFree();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/LibFunctionWithInvalidValue", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>LibFunctionWithInvalidValue\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) libFunctionWithInvalidValue();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
-
-    router.POST("/BitShiftingWithNegativeNumber", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>BitShiftingWithNegativeNumber\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) bitShiftingWithNegativeNumber();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
+    router.POST("/CheckCourse", handle_check_course);
 
-    router.POST("/SizeExpression", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>SizeExpression\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) sizeExpression();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
+    router.POST("/InsertOrder", handle_insert_order);
 
-    router.POST("/DataRace", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>DataRace\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) dataRace();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
+    router.POST("/QueryStockbyCode", handle_query_stock_bycode);
 
-    router.POST("/DereferNullPointer", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>DereferNullPointer\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) dereferNullPointer();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
+    router.PATCH("/Grade", handle_grade);
 
-    router.POST("/ModifyObjTwice", [](HttpRequest *req, HttpResponse *resp) {
-        resp->content_type = req->content_type;
-        cJSON *cjson_body = cJSON_Parse(req->body.c_str());
-        char *data = cJSON_GetStringValue(cJSON_GetObjectItem(cjson_body, "data"));
-        printf("=>ModifyObjTwice\t[len=%d],\t[data : %s]\n", strlen(data), data);
-        if (strlen(data) > ::i_data_len) modifyObjTwice();
-        resp->json["data"] = data;
-        cJSON_Delete(cjson_body);
-        return 200;
-    });
+    router.PUT("/Json", handle_json);
 
     http_server_t server;
     server.port = port;
     // uncomment to test multi-processes
-    // server.worker_processes = 4;
+    server.worker_processes = 4;
     // uncomment to test multi-threads
     // server.worker_threads = 4;
     server.service = &router;
 
-#if 1
-    http_server_run(&server);
-#else
-    // test http_server_stop
-    http_server_run(&server, 0);
-    sleep(30);
-    http_server_stop(&server);
-#endif
+    // 创建子进程
+    child_pid = fork();
+
+    if (child_pid < 0) {
+        // fork失败
+        perror("fork failed");
+        exit(1);
+    }
+    else if (child_pid == 0) {
+        // 子进程
+        printf("启动子进程...\n");
+        // start_tcp_echo_server();
+        test_websocket_server();
+    }
+    else {
+        // 父进程
+        printf("父进程PID: %d, 子进程PID: %d\n", getpid(), child_pid);
+        http_server_run(&server);
+    }
 
     return 0;
 }

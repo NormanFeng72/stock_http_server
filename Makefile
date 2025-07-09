@@ -104,7 +104,7 @@ wget: prepare
 	$(MAKEF) TARGET=$@ SRCDIRS=". base utils event evpp http http/client" SRCS="examples/wget.cpp"
 
 http_server_test: prepare
-	$(MAKEF) TARGET=$@ SRCDIRS=". base utils event evpp http http/server cjson stock cwesamples" SRCS="examples/http_server_test.cpp"
+	$(MAKEF) TARGET=$@ SRCDIRS=". base utils event evpp http http/server http/client cjson stock" SRCS="examples/http_server_test.cpp"
 
 http_client_test: prepare
 	$(MAKEF) TARGET=$@ SRCDIRS=". base utils event evpp http http/client" SRCS="examples/http_client_test.cpp"

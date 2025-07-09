@@ -9,6 +9,8 @@ make clean
 
 # ./configure --with-openssl
 ./configure --without-openssl 
+./configure CFLAGS="-fsanitize=address" CXXFLAGS="-fsanitize=address"
+# --without-openssl --enable_asan
 # make CC=abf-gcc CXX=abf-g++
 make CC=gcc CXX=g++
 

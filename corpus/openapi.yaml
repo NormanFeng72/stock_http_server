@@ -1,0 +1,192 @@
+openapi: 3.0.1
+info:
+  title: http stock test
+  version: 1.0.0
+servers:
+  - url: http://192.168.5.94:9090/
+paths:
+  /WithdrawOrder:
+    get:
+      parameters:
+        - name: order_id
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 65535
+            example: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: string
+            application/xml:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties: {}
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties: {}
+  /CheckCourse:
+    post:
+      responses:
+        '200':
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                weekday:
+                  type: string
+                  example: MONDAY
+                  enum:
+                    - MONDAY
+                    - TUESDAY
+                    - WEDNESDAY
+                    - THURSDAY
+                    - FRIDAY
+                    - SATDAY
+                    - SUNDAY
+                    - Overtime
+                hours:
+                  type: number
+                  format: float
+                  multipleOf: 0.01
+                  example: 9.3
+                  minimum: 8
+                  maximum: 24
+                qty:
+                  type: integer
+                  minimum: 0
+                  maximum: 65535
+                  example: 1
+                notes:
+                  type: string
+                  maxLength: 1024
+                  example: 备注
+  /InsertOrder:
+    post:
+      responses:
+        '200':
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: string
+            application/xml:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties: {}
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties: {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session_id:
+                  type: integer
+                  example: 1
+                order_id:
+                  type: integer
+                  minimum: 0
+                  maximum: 65535
+                  example: 1
+                ticker:
+                  type: string
+                  example: '000001'
+                  format: number
+                  minLength: 6
+                  maxLength: 6
+                market:
+                  type: string
+                  enum:
+                    - CFFEX
+                    - SHFE
+                    - DCE
+                    - CZCE
+                    - INE
+                    - GFEX
+                price:
+                  type: number
+                  example: 24.2
+                qty:
+                  type: integer
+                  minimum: 0
+                  maximum: 65535
+                  example: 1000
+                side:
+                  type: string
+                  enum:
+                    - 买
+                    - 卖
+                    - 申购
+                client_id:
+                  type: integer
+                  minimum: 0
+                  maximum: 65535
+                  example: 1
+                business_type:
+                  type: string
+                  enum:
+                    - 普通股票业务
+                    - 新股申购业务
+                    - 回购业务
+                    - 期权业务
+  /QueryStockbyCode:
+    post:
+      responses:
+        '200':
+          description: OK
+          content:
+            '*/*':
+              schema:
+                type: string
+            application/xml:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties: {}
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties: {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                stock_code:
+                  type: string
+                  format: number
+                  example: '000001'
+                  minLength: 6
+                  maxLength: 6
