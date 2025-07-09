@@ -1,0 +1,437 @@
+
+#include "main.h"
+#include "utils.h"
+#include "string.h"
+
+char logTxt[2048];
+char errorTxt[2048];
+AccountClass *acct;
+QuoteClass *quote;
+AcctListClass *acc_list;
+HoldingsClass *holdings;
+std::list<OrderClass> *order_list;
+static long order_id;
+char success_logfile[] = "log/success.txt";
+char log_file_name[] = "log/log.txt";
+
+bool isValidMktID(int mktID)
+{
+    if (mktID < SHA || mktID > SME)
+    {
+        return false;
+    }
+    return true;
+}
+
+void printOrderList()
+{
+    std::list<OrderClass>::iterator iter;
+    for (iter = order_list->begin(); iter != order_list->end(); iter++)
+    {
+        iter->print();
+    }
+}
+
+int initial()
+{
+    acct = new AccountClass();
+    quote = new QuoteClass();
+    holdings = new HoldingsClass();
+    order_list = new std::list<OrderClass>();
+    memset(logTxt, 0, 2048);
+    memset(errorTxt, 0, 2048);
+    int ret_code;
+    char acct_id[] = "1";
+    // 读取账户列表，并（根据acct_id）取得测试账户
+    acc_list = new AcctListClass();
+    acc_list->read();
+    ret_code = acc_list->getAcct(acct_id, acct);
+    if (ret_code != 0)
+    {
+        sprintf(errorTxt, "Error: 账户id=[%s]不存在!\n", acct_id);
+        printf("Error: 账户id=[%s]不存在!\n", acct_id);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -1;
+    }
+
+    // 读取行情列表
+    quote->read();
+
+    // 读取持仓
+    holdings->read();
+
+    // 打印信息
+    printf("============================acct============================\n");
+    acct->print();
+    printf("============================holdings============================\n");
+    holdings->print();
+
+    // 初始化交易申报队列
+
+    // 委托编号从1开始
+    order_id = 1;
+
+    // 删除之前的log文件
+    // std::system("rm -f log/*.txt");
+
+    return 0;
+}
+
+int queryStockbyCode(char *stock_code, StockClass *stock)
+{
+    int ret = quote->queryStockbyCode(stock_code, stock);
+    if (ret != 0)
+    {
+
+        printf("Error: 股票[%s]不存在!\n", stock_code);
+        sprintf(errorTxt, "Error: 股票[%s]不存在!\n", stock_code);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -404;
+    }
+    memset(logTxt, 0, 2048);
+    sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "用代码查股票", stock->stock_code.c_str(), stock->stock_name.c_str(), stock->mkt.c_str());
+    UtilsClass::writeMsg(success_logfile, logTxt);
+    return 0;
+}
+
+int queryStock(char *stock_code, int mkt_id, StockClass *stock)
+{
+    if (isValidMktID(mkt_id) == false)
+    {
+        printf("Error: mkt_id 无效[%d], 有效的范围是[大于等于 %d, 且小于等于 %d]!\n", mkt_id, SHA, SME);
+        sprintf(errorTxt, "Error: mkt_id 无效[%d], 有效的范围是[大于等于 %d, 且小于等于 %d]!\n", mkt_id, SHA, SME);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -404;
+    }
+
+    int ret = quote->queryStock(stock_code, mkt_id, stock);
+    if (ret != 0)
+    {
+        printf("Error: 股票[%s]不存在!\n", stock_code);
+        sprintf(errorTxt, "Error: 股票[%s]不存在!\n", stock_code);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -404;
+    }
+    memset(logTxt, 0, 2048);
+    sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "复合条件查股票", stock->stock_code.c_str(), stock->stock_name.c_str(), stock->mkt.c_str());
+    UtilsClass::writeMsg(success_logfile, logTxt);
+    return 0;
+}
+
+int buyStock(StockClass *stock, float price, int qty)
+{
+
+    stock->print();
+    // 检查账户是否有开通该市场的交易许可
+    if (acct->mktPermission((char *)stock->mkt.c_str()) != true)
+    {
+        printf("Error: 账户Acct[name=%s]没有市场[%s]的交易许可,需先开户!\n", acct->cust_name.c_str(), stock->mkt.c_str());
+        sprintf(errorTxt, "Error: 账户Acct[name=%s]没有市场[%s]的交易许可,需先开户!\n", acct->cust_name.c_str(), stock->mkt.c_str());
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -501;
+    }
+    // 检查交易数量不等于0
+    if (qty == 0)
+    {
+        printf("Error: 买入数量必须大于零!\n");
+        sprintf(errorTxt, "Error: 买入数量必须大于零!\n");
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -502;
+    }
+
+    // 检查交易数量是否100的倍数
+    if (qty % 100 != 0)
+    {
+        printf("Error: 买入数量[%d]必须是100的整数倍!\n", qty);
+        sprintf(errorTxt, "Error: 买入数量[%d]必须是100的整数倍!\n", qty);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -502;
+    }
+    // 检查账户余额是否充足
+    if (qty * price > acct->balance)
+    {
+        printf("Error: 余额不足[%f], 买入[Code=%s, qty=%d, price=%f]!\n", acct->balance, stock->stock_code.c_str(), qty, price);
+        sprintf(errorTxt, "Error: 余额不足[%f], 买入[Code=%s, qty=%d, price=%f]!\n", acct->balance, stock->stock_code.c_str(), qty, price);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -505;
+    }
+
+    // 检查报价是否大于昨日收盘价的10%（涨跌幅限制统一按10%计）
+    if ((price > (std::atof(stock->close_price.c_str()) + 0.00001) * 1.1) || price < ((std::atof(stock->close_price.c_str()) + 0.00001) * 0.90))
+    {
+        printf("Error: 报价超过涨跌幅限制, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        sprintf(errorTxt, "Error: 报价超过涨跌幅限制, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -506;
+    }
+
+    // 如果报价高于昨日收盘，则直接买入成交，如果低于昨日收盘则加入交易申报队列
+    if (price > (std::atof(stock->close_price.c_str()) + 0.00001))
+    {
+        printf("Success: 买入直接成交, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        holdings->update_holdings("买入", qty, *stock);
+    }
+    else
+    {
+        printf("Success: 报价低于昨日收盘价, 加入交易申报队列, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        OrderClass order = OrderClass();
+        order.trade_date = UtilsClass::getDate();
+        order.stock_code = stock->stock_code;
+        order.stock_name = stock->stock_name;
+        order.mkt = stock->mkt;
+        order.order_type = "买入";
+        order.price = std::to_string(price);
+        order.qty = std::to_string(qty);
+        order.status = "排队中";
+        order.order_id = order_id++;
+        order_list->push_back(order);
+        printf("============================place the order into trading list============================\n");
+        order.print();
+    }
+    memset(logTxt, 0, 2048);
+    sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "买入股票", stock->stock_code.c_str(), stock->stock_name.c_str(), stock->mkt.c_str());
+    UtilsClass::writeMsg(success_logfile, logTxt);
+
+    return 0;
+}
+
+int buyStockbyCode(char *stock_code, float price, int qty)
+{
+    StockClass *stock = new StockClass();
+    int ret = queryStockbyCode(stock_code, stock);
+    if (ret != 0)
+    {
+        delete stock;
+        return -404;
+    }
+    printf("============================found out stock============================\n");
+    if (buyStock(stock, price, qty) != 0)
+    {
+        delete stock;
+        return -500;
+    }
+    delete stock;
+    return 0;
+}
+
+int buyStockbyComboConditions(char *stock_code, int mktID, float price, int qty)
+{
+    StockClass *stock = new StockClass();
+    int ret = queryStock(stock_code, mktID, stock);
+    if (ret != 0)
+    {
+        delete stock;
+        return -404;
+    }
+    printf("============================found out stock============================\n");
+    if (buyStock(stock, price, qty) != 0)
+    {
+        delete stock;
+        return -500;
+    }
+    delete stock;
+    return 0;
+}
+
+int sellStock(StockClass *stock, float price, int qty)
+{
+    // 检查账户是否有开通该市场的交易许可
+    if (acct->mktPermission((char *)stock->mkt.c_str()) != true)
+    {
+        printf("Error: 账户Acct[name=%s]没有市场[%s]的交易许可,需先开户!\n", acct->cust_name.c_str(), stock->mkt.c_str());
+        sprintf(errorTxt, "Error: 账户Acct[name=%s]没有市场[%s]的交易许可,需先开户!\n", acct->cust_name.c_str(), stock->mkt.c_str());
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -501;
+    }
+    // 检查交易数量不等于0
+    if (qty == 0)
+    {
+        printf("Error: 卖出数量必须大于零!\n");
+        sprintf(errorTxt, "Error: 卖出数量必须大于零!\n");
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -502;
+    }
+    // 检查账户是否持有该股票，股票余额是否充足
+    if (holdings->query_holdings(*stock) < 0)
+    {
+        printf("Error: 账户Acct[name=%s]没有该股票[%s]!\n", acct->cust_name.c_str(), stock->stock_code.c_str());
+        sprintf(errorTxt, "Error: 账户Acct[name=%s]没有该股票[%s]!\n", acct->cust_name.c_str(), stock->stock_code.c_str());
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -601;
+    }
+    if (holdings->query_holdings(*stock) < qty)
+    {
+        printf("Error: 账户Acct[name=%s]股票[%s]的余额[%d]不足, 卖出的股票数量[%d]!\n", acct->cust_name.c_str(), stock->stock_code.c_str(), holdings->query_holdings(*stock), qty);
+        sprintf(errorTxt, "Error: 账户Acct[name=%s]股票[%s]的余额[%d]不足, 卖出的股票数量[%d]!\n", acct->cust_name.c_str(), stock->stock_code.c_str(), holdings->query_holdings(*stock), qty);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -602;
+    }
+    // 检查报价是否小于昨日收盘价的10%（涨跌幅限制统一按10%计）
+    if ((price > (std::atof(stock->close_price.c_str()) + 0.00001) * 1.1) || price < ((std::atof(stock->close_price.c_str()) + 0.00001) * 0.90))
+    {
+        printf("Error: 报价超过涨跌幅限制, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        sprintf(errorTxt, "Error: 报价超过涨跌幅限制, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+        return -506;
+    }
+    // 如果报价低于昨日收盘，则直接卖出成交，如果高于昨日收盘则加入交易申报队列
+    if (price > (std::atof(stock->close_price.c_str()) + 0.00001))
+    {
+        printf("Success: 卖出报价高于昨日收盘价, 加入交易申报队列, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        OrderClass order = OrderClass();
+        order.trade_date = UtilsClass::getDate();
+        order.stock_code = stock->stock_code;
+        order.stock_name = stock->stock_name;
+        order.mkt = stock->mkt;
+        order.order_type = "卖出";
+        order.price = std::to_string(price);
+        order.qty = std::to_string(qty);
+        order.status = "排队中";
+        order.order_id = order_id++;
+        order_list->push_back(order);
+        printf("============================place the order into trading list============================\n");
+        order.print();
+    }
+    else
+    {
+        printf("Success: 卖出直接成交, 报价[股票=%s, 昨收=%s, price=%f]!\n", stock->stock_code.c_str(), stock->close_price.c_str(), price);
+        holdings->update_holdings("卖出", qty, *stock);
+    }
+    memset(logTxt, 0, 2048);
+    sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "卖出股票", stock->stock_code.c_str(), stock->stock_name.c_str(), stock->mkt.c_str());
+    UtilsClass::writeMsg(success_logfile, logTxt);
+
+    return 0;
+}
+
+int sellStockbyCode(char *stock_code, float price, int qty)
+{
+    StockClass *stock = new StockClass();
+    int ret = queryStockbyCode(stock_code, stock);
+    if (ret != 0)
+    {
+        delete stock;
+        return -404;
+    }
+    printf("============================found out stock============================\n");
+    stock->print();
+    if (sellStock(stock, price, qty) != 0)
+    {
+        delete stock;
+        return -600;
+    }
+
+    delete stock;
+    return 0;
+}
+
+int sellStockbyComboConditions(char *stock_code, int mktID, float price, int qty)
+{
+    StockClass *stock = new StockClass();
+    int ret = queryStock(stock_code, mktID, stock);
+    if (ret != 0)
+    {
+        delete stock;
+        return -404;
+    }
+    printf("============================found out stock============================\n");
+    stock->print();
+    if (sellStock(stock, price, qty) != 0)
+    {
+        delete stock;
+        return -600;
+    }
+
+    delete stock;
+    return 0;
+}
+
+int withdrawOrder(long id)
+{
+    OrderClass item;
+    std::list<OrderClass>::iterator iter_order;
+    for (iter_order = order_list->begin(); iter_order != order_list->end(); iter_order++)
+    {
+        item = *iter_order;
+        if (item.order_id == id && item.status != "已撤单")
+        {
+            iter_order->status = "已撤单";
+            printf("Success: 撤单成功, 委托编号[id=%ld]!\n", id);
+            memset(logTxt, 0, 2048);
+            sprintf(logTxt, "%s, %s, %s, %s, %s\n", UtilsClass::getDateTimeString().c_str(), "撤单成功", item.stock_code.c_str(), item.stock_name.c_str(), item.mkt.c_str());
+            UtilsClass::writeMsg(success_logfile, logTxt);
+            return 0;
+        }
+        if (item.order_id == id && item.status == "已撤单")
+        {
+            printf("Error: 重复撤单, 委托编号[id=%ld]之前已经被撤单了!\n", id);
+            sprintf(errorTxt, "Error: 重复撤单, 委托编号[id=%ld]之前已经被撤单了!\n", id);
+            // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+            return -701;
+        }
+    }
+    printf("Error: 撤单失败, 找不到委托单[id=%ld]!\n", id);
+    sprintf(errorTxt, "Error: 撤单失败, 找不到委托单[id=%ld]!\n", id);
+    // UtilsClass::writeLog(log_file_name, LOG_ERROR, errorTxt);
+    return -704;
+}
+
+int main(int argc, char *argv[])
+{
+    std::string sbuffer;
+
+    initial();
+    printf("============================print holdings============================\n");
+    holdings->print();
+
+    // UtilsClass::writeLog(log_file_name, LOG_INFO, "初始化完成！");
+    int ret_code;
+
+    // 读取文件的内容
+    if (argc >= 2)
+    {
+        printf("============================read corpus============================\n");
+        StockClass *stock = new StockClass();
+        sbuffer = UtilsClass::readFile(argv[1]);
+        if (sbuffer.length() == 6)
+        {
+            printf("corpus data:%s\n", sbuffer.c_str());
+            if (queryStockbyCode((char *)sbuffer.c_str(), stock) == 0)
+            {
+                stock->print();
+            }
+        }
+        delete stock;
+    }
+
+    // ret_code = buyStockbyCode("000002", 16, 1000);
+
+    // ret_code = sellStockbyCode("000002", 14, 500);
+
+    // ret_code = buyStockbyComboConditions("002142", SME, 29, 1000);
+
+    // ret_code = buyStockbyCode("000021", 16, 2000);
+
+    // ret_code = buyStockbyCode("000045", 9.8, 1000);
+
+    // ret_code = sellStockbyComboConditions("000002", SZA, 14, 1);
+
+    // printf("============================print holdings============================\n");
+    // holdings->print();
+
+    // printf("============================print trading log============================\n");
+    // printOrderList();
+
+    // withdrawOrder(1);
+    // withdrawOrder(3);
+    // withdrawOrder(1);
+
+    // printf("============================print trading log============================\n");
+    // printOrderList();
+
+    delete holdings;
+    delete acc_list;
+    delete quote;
+    delete acct;
+    delete order_list;
+}
